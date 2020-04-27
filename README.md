@@ -9,5 +9,5 @@ The following study examined the potential impact of changing the current race a
 
 **Deliverables**
 
-- [Final Project Paper]()
-- [Supporting Code]()
+- [Final Project Paper](https://github.com/katieymo/census_race_ethnicity/blob/master/W241_FinalPaper_Borojerdi_Mo.pdf)
+- [Supporting Code](https://htmlpreview.github.io/?https://github.com/katieymo/census_race_ethnicity/blob/master/final_project_notebook.html)
