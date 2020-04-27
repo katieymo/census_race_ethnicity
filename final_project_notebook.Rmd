@@ -1,0 +1,840 @@
+---
+title: "W241 Final Project: Effects of Changing the Census Race and Ethnicity Question"
+author: Katie Mo & Kat Borojerdi
+output: 
+  html_document: 
+    toc: true
+    toc_depth: 5
+---
+
+### 0. POWER CALCULATION
+
+We used the results in Table 4 from the 2015 National Content Test Race and Ethnicity Analysis Report (https://www2.census.gov/programs-surveys/decennial/2020/program-management/final-analysis-reports/2015nct-race-ethnicity-analysis.pdf) to estimate a 3.4% treatment effect of the proposed survey format on White selections for our power calculation. We estimated that we would need 5000 people to reach at least 80% statistical power.
+
+```{r}
+power_test <- function(N) {
+ no_treat <- rbinom(N/2, size = 1, prob = 0.786)
+ treat    <- rbinom(N/2, size = 1, prob = 0.752)
+
+ res <- t.test(no_treat, treat)$p.value
+ return(res)
+ }
+
+power <- replicate(1000, power_test(5000))
+mean(power < 0.05)
+```
+
+### I. DATA LOAD AND CLEAN UP
+
+#### a. Load Packages
+
+```{r, results='hide', message=FALSE} 
+#load packages 
+library(foreign)
+library(data.table)
+library(sandwich)
+library(lmtest)
+library(stargazer)
+library(xtable)
+library(mlogit)
+```
+
+#### b. Load Data
+
+First, we will load the data exported from Qualtrics as csv files. Since we had two sources of recruitment, we will concatenate the data into a single data table. Most of our data is from facebook ads, but we also have a handful of data from friends and family.
+
+```{r}
+#load data from facebook ads, remove first 2 rows and add source column
+data_fb <- fread("./W241 study - Facebook Ads_July 30, 2019_19.28.csv")
+data_fb <- data_fb[-c(1,2),]
+data_fb[ , Source := "Facebook Ads"]
+
+#load data from friends and family, remove first 2 rows add source column
+data_ff <- fread("./W241 study - Friends and Family_July 28, 2019_15.13.csv")
+data_ff <- data_ff[-c(1,2),]
+data_ff[ , Source := "Friends and Family"]
+
+#load data from university clubs, remove first 2 rows add source column
+data_ucb <- fread("./W241 study - University clubs MENA_August 4, 2019_21.20.csv", nrows=4) 
+data_ucb <- data_ucb[-c(1,2),]
+data_ucb[ , Source := "University Clubs MENA"]
+
+#concatenate the three data sets into one
+data <- rbind(data_fb, data_ff, data_ucb, fill=TRUE)
+
+#number of observations by source
+data_source <- data[ ,.N, by=.(Source)]
+data_source
+```
+
+#### c. Data Conversion
+
+Convert some of the columns into certain data types, such as date, numeric, or factor.
+
+```{r, message=F, echo=T, results='hide'}
+#convert column types
+
+data[ , `StartDate` := as.Date(`StartDate`)]
+data[ , `EndDate` := as.Date(`EndDate`)]
+data[ , `Progress` := as.numeric(`Progress`)]
+data[ , `Duration (in seconds)` := as.numeric(`Duration (in seconds)`)]
+data[ , `Finished` := as.numeric(`Finished`)]
+data[ , `ResponseId` := as.numeric(`ResponseId`)]
+data[ , LocationLatitude := as.numeric(LocationLatitude)]
+data[ , LocationLongitude := as.numeric(LocationLongitude)]
+data[ , `Q1_First Click` := as.numeric(`Q1_First Click`)]
+data[ , `Q1_Last Click` := as.numeric(`Q1_Last Click`)]
+data[ , `Q1_Page Submit` := as.numeric(`Q1_Page Submit`)]
+data[ , `Q1_Click Count` := as.numeric(`Q1_Click Count`)]
+data[ , `Q3` := as.factor(`Q3`)]
+data[ , `Q4` := as.factor(`Q4`)]
+data[ , `Q5` := as.factor(`Q5`)]
+data[ , `Q6` := as.factor(`Q6`)]
+data[ , `Q7` := as.factor(`Q7`)]
+data[ , `V1_First Click` := as.numeric(`V1_First Click`)]
+data[ , `V1_Page Submit` := as.numeric(`V1_Page Submit`)]
+data[ , `V1_Click Count` := as.numeric(`V1_Click Count`)]
+data[ , `V1_Last Click` := as.numeric(`V1_Last Click`)]
+data[ , `V2` := as.factor(`V2`)]
+data[ , `V3` := as.factor(`V3`)]
+data[ , `V4` := as.factor(`V4`)]
+data[ , `C1_First Click` := as.numeric(`C1_First Click`)]
+data[ , `C1_Page Submit` := as.numeric(`C1_Page Submit`)]
+data[ , `C1_Click Count` := as.numeric(`C1_Click Count`)]
+data[ , `C1_Last Click` := as.numeric(`C1_Last Click`)]
+data[ , `C2` := as.factor(`C2`)]
+data[ , `C3` := as.factor(`C3`)]
+data[ , `T1_First Click` := as.numeric(`T1_First Click`)]
+data[ , `T1_Page Submit` := as.numeric(`T1_Page Submit`)]
+data[ , `T1_Click Count` := as.numeric(`T1_Click Count`)]
+data[ , `T1_Last Click` := as.numeric(`T1_Last Click`)]
+```
+
+#### d. Data Summary
+
+We make the assumption that those who submitted the previous covariate page reached the ethnic question, where randomization into control and treatment survey occurs. We can create a treatment column to identify those who were shown the control versus treatment survey. If the column `C1_First Click` is not empty, then identify the row as assigned to control. If the column `T1_First Click` is not empty, then identify the row as assigned to treatment. 
+
+Those that did not reach the ethnic question and did not get assigned to a treatment group are called non-compliers. Those that reached the ethnic question but did not get make a first click were assigned to a treatment group, however we are unable to detect which survey they saw as both first click columns were empty. These were considered attriters. Those that reached the ethnic question, made a first click on either the control or treatment survey, but did not complete the survey as their progress was not 100 were also considered to be attriters. 
+
+```{r}
+#identify whether assigned to control or treatment based on whether their first click is recorded in a control or treatment column
+data[is.na(`C1_First Click`)==FALSE, "Treatment" := 0]
+data[is.na(`T1_First Click`)==FALSE, "Treatment" := 1]
+
+#identify those who did not complete the survey
+data[ , "Completed" := ifelse(Progress==100, 1, 0)]
+
+#non-compliers are those who did not reach the ethnic question and thus did not get assigned to any group
+data[ , "Reached_Ethnic_Question" := ifelse(is.na(`V1_Page Submit`)==FALSE, 1, 0)]
+
+#attriters are those who reached the ethnic question, but did not make a first click and exited the survey
+data[ , Attrition := 0]
+data[Reached_Ethnic_Question==1 & is.na(Treatment)==TRUE, Attrition := 1]
+
+#attriters are also those who reached the ethnic question, made a first click, but did not complete the survey as their progress is not 100
+data[Reached_Ethnic_Question==1 & Progress!=100, Attrition := 1]
+
+#attriters were also those who completed the survey but indicated that they did not want to disclose their ethnicity/race using the write in spaces
+data[`C3_15_TEXT`=="Not applicanle", Attrition := 1]
+data[`C3_15_TEXT`=="I do not answer racist questions.", Attrition := 1]
+
+#exclude the observations who were not living in the U.S.
+data[ , Region_notUS := ifelse(V3=="I am not currently living in the U.S.", 1, 0)]
+
+#number of observations by reached ethnic question, attrition, and treatment variables
+data_summary <- data[, .N, by=.(Completed, Region_notUS, Reached_Ethnic_Question, Attrition, Treatment)]
+setorderv(data_summary, c("Completed", "Region_notUS", "Reached_Ethnic_Question", "Attrition", "Treatment"))
+data_summary
+```
+```{r echo=T, results='hide'}
+print(xtable(data_summary, digits=c(0,0,0,0,0,0, 0), caption="Participant Categories"), include.rownames=FALSE)
+```
+
+
+```{r echo=T, results='hide'}
+#Attriters that completed the survey but indicated that they did not want to disclose their race or ethnicity
+data[`C3_15_TEXT`=="Not applicanle" | `C3_15_TEXT`=="I do not answer racist questions.", ]
+```
+
+Because we are only interested in the reponses of those participants who reside in the U.S, we will remove the 3 observations that responded that they are not currently living in the U.S. 
+
+```{r}
+#Removed 3 data points for those who do not reside in the US
+data_remove <- data[ ,.N, by=.(Region_notUS)]
+data_remove
+
+data <- data[Region_notUS==0]
+```
+
+#### e. Data Correction
+
+We noticed that there were a handful of observations in the treatment survey who clicked on a subgroup checkbox but did not select the main level checkbox. This was a limitation in the survey design software that Qualtrics provided. We make the assumption that when a subgroup checkbox was selected, the main level checkbox would have also been selected.
+
+```{r}
+#Need to do some corrections for people that only checked subgroup boxes but not the main level box
+#The observations needing corrections were found by if their T2 column did not include four consecutive uppercase letters, since main level checkboxes were presented in all caps
+data[ , Correction_Needed := 0]
+data[grepl("[A-Z][A-Z][A-Z][A-Z]", T2)==FALSE & T2!="", Correction_Needed := 1]
+data[Treatment==1, .N, by=.(Correction_Needed)]
+```
+
+```{r echo=T, results='hide'}
+#Create lists for all the possible subgroup checkboxes for each main level category
+white_subgroups <- c("German", "Irish", "English", "Italian", "Polish", "French", "Print, for example, Scottish, Norwegian, Dutch, etc.")
+hispanic_subgroups <- c("Mexican or Mexican American", "Puerto Rican", "Cuban", "Salvadoran", "Dominican", "Colombian", "Print, for example, Guatemalan, Spaniard, Ecuadorian, etc.")
+black_subgroups <- c("African American", "Jamaican", "Haitian", "Nigerian", "Ethiopian", "Somali", "Print, for example, Ghanaian, South African, Barbadian, etc.")
+asian_subgroups <- c("Chinese", "Filipino", "Asian Indian", "Vietnamese", "Korean", "Japanese", "Print, for example, Pakistani, Cambodian, Hmong, etc.")
+mideastern_subgroups <- c("Lebanese", "Iranian", "Egyptian", "Syrian", "Moroccan", "Israeli", "Print, for example, Algerian, Iraqi, Kurdish, etc.")
+hawaiian_subgroups <- c("Native Hawaiian", "Samoan", "Chamorro", "Tongan", "Figian", "Marshallese", "Print, for example, Palauan, Tahitian, Chuukese, etc.")
+
+#Create a function to make the correction
+correction <- function(s_orig){
+  
+  #First, from the original response, create a list of words split using comma as the delimiter
+  if (grepl(",", s_orig)){
+    s_split <- strsplit(s_orig, ",")
+    n_split <- length(s_split[[1]])
+    i <- 1
+    s <- c()
+    
+    #Because there is a checkbox with "Print, for example, x, y, z, etc.", which contains commas, we need to concatenate these back into one item
+    while (i <= n_split){
+      if (s_split[[1]][i] == "Print"){
+        s <- append(s, paste(s_split[[1]][i:(i+5)], collapse=","))
+        i <- i+6}
+      else {s <- append(s, s_split[[1]][i])}
+      i <- i+1}} 
+  else {s <- s_orig[[1]]}
+
+  #Then, looping through the list of split items, if the item is in a certain subgroup list, then append the verbiage from the corresponding main level checkbox
+  n <- length(s)
+  corrected_vector <- c()
+  for (i in seq(n)){
+    if (s[i] %in% white_subgroups){
+      corrected_vector <- append(corrected_vector, c("WHITE – Provide details below.", s[i]))}
+    else if (s[i] %in% hispanic_subgroups){
+      corrected_vector <- append(corrected_vector, c("HISPANIC, LATINO, OR SPANISH – Provide details below.", s[i]))}
+    else if (s[i] %in% black_subgroups){
+      corrected_vector <- append(corrected_vector, c("BLACK OR AFRICAN AMERICAN – Provide details below.", s[i]))}
+    else if (s[i] %in% asian_subgroups){
+      corrected_vector <- append(corrected_vector, c("ASIAN – Provide details below.", s[i]))}
+    else if (s[i] %in% mideastern_subgroups){
+      corrected_vector <- append(corrected_vector, c("MIDDLE EASTERN OR NORTH AFRICAN – Provide details below.", s[i]))}
+    else if (s[i] %in% hawaiian_subgroups){
+      corrected_vector <- append(corrected_vector, c("NATIVE HAWAIIAN OR OTHER PACIFIC ISLANDER – Provide details below.", s[i]))}
+  }
+  
+  #Since there could be multiple subgroup checkboxes selected from the same main level group, remove the duplicated main level verbiage using the unique function
+  corrected_string <- paste(unique(corrected_vector), collapse=",")
+  return(corrected_string)
+}
+
+#Call the correction function for each unique response in the T2 column
+needs_correction <- as.vector(unique(data[Correction_Needed==1,T2]))
+for (T2_string in needs_correction){
+  T2_corrected_string <- correction(T2_string)
+  data[T2==T2_string, T2 := T2_corrected_string]
+  
+  #Print the original and corrected strings to inspect whether the correction was performed properly
+  print(paste("original:", T2_string))
+  print(paste("corrected:", T2_corrected_string))
+}
+``` 
+
+#### f. One Hot Encode Outcome Variables
+
+```{r}
+#One hot encode ethnicities so they can be directly compared between the control and treatment survey.
+
+data[ , White := 0]
+data[grepl("White", C3), White := 1]   #control survey
+data[grepl("WHITE", T2), White := 1]   #treatment survey
+
+data[ , Other := 0]
+data[grepl("Some other race", C3), Other := 1]  #control survey
+data[grepl("SOME OTHER RACE OR ETHNICITY", T2), Other := 1]  #treatment survey
+
+data[ , Hispanic := 0]
+data[grepl("Yes", C2), Hispanic := 1]  #control survey
+data[grepl("HISPANIC, LATINO, OR SPANISH", T2), Hispanic := 1]  #treatment survey
+
+data[ , Black := 0]
+data[grepl("Black or African Am.", C3), Black := 1]  #control survey
+data[grepl("BLACK OR AFRICAN AMERICAN", T2), Black := 1]  #treatment survey
+
+data[ , Asian := 0]
+data[grepl("Chinese", C3), Asian := 1]  #control survey
+data[grepl("Filipino", C3), Asian := 1]
+data[grepl("Asian Indian", C3), Asian := 1]
+data[grepl("Vietnamese", C3), Asian := 1]
+data[grepl("Korean", C3), Asian := 1]
+data[grepl("Japanese", C3), Asian := 1]
+data[grepl("Other Asian", C3), Asian := 1]
+data[grepl("ASIAN", T2), Asian := 1]  #treatment survey
+
+data[ , AmericanIndian := 0]
+data[grepl("American Indian or Alaska Native", C3), AmericanIndian := 1]  #control survey
+data[grepl("AMERICAN INDIAN OR ALASKA NATIVE", T2), AmericanIndian := 1]  #treatment survey
+
+data[ , MENA := 0]
+data[grepl("MIDDLE EASTERN OR NORTH AFRICAN", T2), MENA := 1]  #treatment survey
+#The control survey does not have a MENA cateogry. A separate variable to identify those who have written in a MENA category in the control survey is created in a later section.
+
+data[ , PacificIslander := 0]
+data[grepl("Native Hawaiian", C3), PacificIslander := 1]  #control survey
+data[grepl("Samoan", C3), PacificIslander := 1]
+data[grepl("Chamorro", C3), PacificIslander := 1]
+data[grepl("Other Pacific Islander", C3), PacificIslander := 1]
+data[grepl("NATIVE HAWAIIAN OR OTHER PACIFIC ISLANDER", T2), PacificIslander := 1]  #treatment survey
+```
+
+
+### II. EXPLORATORY DATA ANALYSIS
+
+#### a. Distribution of Race/Ethnicities 
+
+```{r}
+#Number of selections by treatment group
+race_counts <- data[Reached_Ethnic_Question==1 & Attrition==0, .("White"=sum(White), "Other"=sum(Other), "Hispanic"=sum(Hispanic), "Black"=sum(Black), "Asian"=sum(Asian), "AmericanIndian"=sum(AmericanIndian), "MENA"=sum(MENA), "PacificIslander"=sum(PacificIslander)), by=Treatment]
+race_counts_subtract <- data.table(race_counts[2]-race_counts[1])
+race_counts_subtract[,Treatment := "Difference"]
+race_counts <- rbind(race_counts, race_counts_subtract)
+race_counts
+```
+
+```{r echo=T, results='hide'}
+print(xtable(race_counts, digits=c(0,0,0,0,0,0,0, 0, 0, 0), caption="Proportion of Responses to Race and Ethnic Question"), include.rownames=FALSE)
+```
+
+```{r}
+#Proportion of selections by treatment group
+race_proportions <- data[Reached_Ethnic_Question==1 & Attrition==0, .("White"=mean(White), "Other"=mean(Other), "Hispanic"=mean(Hispanic), "Black"=mean(Black), "Asian"=mean(Asian), "AmericanIndian"=mean(AmericanIndian), "MENA"=mean(MENA), "PacificIslander"=mean(PacificIslander)), by=Treatment]
+race_proportions_subtract <- data.table(race_proportions[2]-race_proportions[1])
+race_proportions_subtract[,Treatment := "Difference"]
+race_proportions <- rbind(race_proportions, race_proportions_subtract)
+race_proportions
+
+#Note that the percentage of people who were counted in the MENA category from the control survey were extrapolated from what they had written in the fill in spaces associated with the White or Other Asian checkboxes. The control survey did not have a separate checkbox for MENA racial categories.
+```
+
+
+```{r}
+#Create a histogram of race/ethnicities selections
+count_white <- data[Reached_Ethnic_Question==1 & Attrition==0, .N, by=.(Treatment, White)]
+count_other <- data[Reached_Ethnic_Question==1 & Attrition==0, .N, by=.(Treatment, Other)]
+count_hispanic <- data[Reached_Ethnic_Question==1 & Attrition==0, .N, by=.(Treatment, Hispanic)]
+count_black <- data[Reached_Ethnic_Question==1 & Attrition==0, .N, by=.(Treatment, Black)]
+count_asian <- data[Reached_Ethnic_Question==1 & Attrition==0, .N, by=.(Treatment, Asian)]
+count_americanindian <- data[Reached_Ethnic_Question==1 & Attrition==0, .N, by=.(Treatment, AmericanIndian)]
+count_mena <- data[Reached_Ethnic_Question==1 & Attrition==0, .N, by=.(Treatment, MENA)]
+count_pacificislander <- data[Reached_Ethnic_Question==1 & Attrition==0, .N, by=.(Treatment, PacificIslander)]
+
+responses <- data.table(
+  Control = c(count_white[White==1 & Treatment==0, N], count_other[Other==1 & Treatment==0, N], count_hispanic[Hispanic==1 & Treatment==0, N],
+              count_black[Black==1 & Treatment==0, N], count_asian[Asian==1 & Treatment==0, N], 
+              count_americanindian[AmericanIndian==1 & Treatment==0, N], 0,
+              count_pacificislander[PacificIslander==1 & Treatment==0, N]),
+  Treatment = c(count_white[White==1 & Treatment==1, N], count_other[Other==1 & Treatment==1, N], count_hispanic[Hispanic==1 & Treatment==1, N],
+                count_black[Black==1 & Treatment==1, N], count_asian[Asian==1 & Treatment==1, N], 
+                0, count_mena[MENA==1 & Treatment==1, N],
+                count_pacificislander[PacificIslander==1 & Treatment==1, N])
+  )
+
+rownames(responses) <- c("White", "Other", "Hispanic", "Black", "Asian", "American\nIndian", "MENA", "Pacific\nIslander")
+colnames(responses) <- c("Control", "Treatment")
+barplot(t(responses), beside=TRUE, names.arg=rownames(responses), legend=colnames(responses), ylim=c(0,300), cex.names=0.9)
+```
+
+#### b. Distribution of Mixed Races
+
+```{r}
+#In the control survey, Hispanic is considered as an ethnic category rather than a racial category. When measuring the number of people who select 2 or more races, the response to this ethnic category question is not considered. Create a new variable that captures the Hispanic responses from the treatment survey only.
+data[ , Hispanic_RaceOnly := 0]
+data[grepl("HISPANIC, LATINO, OR SPANISH", T2), Hispanic_RaceOnly := 1]  
+
+#Create a variable Num_Races which adds the number of races a participant has selected
+data[Reached_Ethnic_Question==1 & Attrition==0, Num_Races := White + Other + Hispanic_RaceOnly + Black + Asian + AmericanIndian + MENA + PacificIslander]
+
+#Binarize the variable Num_Races by creating a new variable Mixed_Race which captures whether or not someone is 2 or more races. 
+data[Reached_Ethnic_Question==1 & Attrition==0, Mixed_Race := ifelse(Num_Races>=2, 1, 0)]
+
+data[Reached_Ethnic_Question==1 & Attrition==0, .N, by=.(Treatment, Mixed_Race)]
+```
+
+#### c. Distribution of Time Spent on Question
+
+```{r}
+#distribution of time spent on ethnic question
+data[Treatment==0, Time := `C1_Page Submit`]
+data[Treatment==1, Time := `T1_Page Submit`]
+
+par(mfrow=c(1,2))
+hist(data[Reached_Ethnic_Question==1 & Attrition==0 & Treatment==0, Time], breaks=seq(0,500,20), xlim=c(0,500), main="Time Spent on Control Question", xlab="Time (sec)", cex.main=0.99)
+hist(data[Reached_Ethnic_Question==1 & Attrition==0 & Treatment==1, Time], breaks=seq(0,4000,20), xlim=c(0,500), main="Time Spent on Treatment Question", xlab="Time (sec)", cex.main=0.99) #one extreme outlier with 3198.5 sec
+```
+
+```{r echo=T, results='hide'}
+#Outlier spent 3198.516 seconds on the treatment survey.
+data[Time>500,]
+```
+```{r}
+#What is the min and max time spent, excluding the extreme outlier?
+min(data[Reached_Ethnic_Question==1 & Attrition==0, Time])
+max(data[Reached_Ethnic_Question==1 & Attrition==0 & Time<500, Time])
+```
+
+
+#### d. Write In Spaces
+
+Because our survey contains write in spaces, we looked at what people had written. 
+
+```{r}
+#Create a function to split the words participants wrote in the fill in spaces
+writein_split <- function(data){
+  writein <- unique(data)
+  writein_split <- c()
+for (entry in writein){
+  writein_split <- append(writein_split, unlist(strsplit(entry, ",|/| |&|-|\\(|\\)|\\.")))
+  }
+  return(sort(unique(tolower(writein_split))))
+}
+```
+
+```{r echo=T, results='hide'}
+#What do people who select White in the control survey write in? There are some responses that should not be counted as a White_Subgroup: "Unknown" and "What the hey? We have people who were colonists from 1636 and people who got off the boat in 1905 in my family. I am.sad your survey doesn't reflect the diversity of the US.".
+
+data[Reached_Ethnic_Question==1 & Attrition==0 & `C3_1_TEXT`!="", C3_1_TEXT]
+```
+
+```{r}
+white_writein_control <- writein_split(data[Reached_Ethnic_Question==1 & Attrition==0 &`C3_1_TEXT`!="", C3_1_TEXT])
+white_writein_control
+```
+
+```{r echo=T, results='hide'}
+#What do people who select White in the treatment survey write in?
+data[Reached_Ethnic_Question==1 & Attrition==0 & `T2_8_TEXT`!="", T2_8_TEXT]
+```
+
+```{r}
+white_writein_treatment <- writein_split(data[Reached_Ethnic_Question==1 & Attrition==0 & `T2_8_TEXT`!="", T2_8_TEXT])
+white_writein_treatment
+```
+
+```{r}
+#What do people who select Other in the control survey write in? The responses "I do not answer racist questions." and "Not applicanle" were treated as attriters. 
+unique(data[`C3_15_TEXT`!="", C3_15_TEXT])
+```
+
+```{r}
+#What do people who select Other in the treatment survey write in?
+unique(data[`T2_49_TEXT`!="", T2_49_TEXT])
+```
+
+```{r}
+#What do people who select Hispanic in the control survey write in? 
+unique(data[`C2_5_TEXT`!="", C2_5_TEXT])
+```
+
+```{r}
+#What do people who select Hispanic in the treatment survey write in?
+unique(data[`T2_16_TEXT`!="", T2_16_TEXT])
+```
+
+```{r}
+#What do people who select Other Asian in the control survey write in?
+unique(data[`C3_10_TEXT`!="", C3_10_TEXT])
+```
+
+```{r}
+#What do people who select Asian in the treatment survey write in?
+unique(data[`T2_32_TEXT`!="", T2_32_TEXT])
+```
+
+```{r}
+#What do people who select MENA in the treatment survey write in?
+unique(data[`T2_40_TEXT`!="", T2_40_TEXT])
+```
+
+
+#### e. MENA Write In for Control Question
+
+```{r}
+#The control survey does not have a MENA cateogry. Make a new variable, MENA_writein, to identify those who have written in a MENA category (from White or Other Asian fill in spaces). Use this variable to compare between those identifying as MENA by writing in the control survey or checking the MENA checkbox in the treatment survey.
+data[ , MENA_writein := 0]
+data[grepl("MIDDLE EASTERN OR NORTH AFRICAN", T2), MENA_writein := 1]
+data[grepl("lebanese", tolower(C3_1_TEXT)), MENA_writein := 1]  #control survey
+data[grepl("lebanese", tolower(C3_1_TEXT)), MENA_writein_category := "White"] 
+data[grepl("egyptian", tolower(C3_1_TEXT)), MENA_writein := 1]
+data[grepl("egyptian", tolower(C3_1_TEXT)), MENA_writein_category := "White"] 
+data[grepl("Pakistani", C3_10_TEXT), MENA_writein := 1]
+data[grepl("Pakistani", C3_10_TEXT), MENA_writein_category := "Other Asian"]
+data[grepl("Arab", C3_10_TEXT), MENA_writein := 1]
+data[grepl("Arab", C3_10_TEXT), MENA_writein_category := "Other Asian"]
+data[grepl("Iranian", C3_10_TEXT), MENA_writein := 1]
+data[grepl("Iranian", C3_10_TEXT), MENA_writein_category := "Other Asian"]
+
+data[Reached_Ethnic_Question==1 & Attrition==0 & MENA_writein==1, .N, by=.(Treatment)]
+```
+
+```{r}
+#What do MENA select when they write in a race that is considered to be MENA?
+data[Reached_Ethnic_Question==1 & Attrition==0 & MENA_writein==1 & Treatment==0, .N, by=.(MENA_writein_category)]
+```
+
+
+#### f. Hispanic Selection for Control Question
+
+```{r}
+#What do people who select Hispanic in the first ethnicity quetion select for the second race question in the control survey?
+hispanic_control_selection <- data[Reached_Ethnic_Question==1 & Attrition==0 & Hispanic==1 & Treatment==0, .("Select_White" = mean(White), "Select_Other" = mean(Other), "Select_Asian" = mean(Asian), "Select_AmericanIndian" = mean(AmericanIndian))]
+hispanic_control_selection
+```
+
+### III. COVARIATE BALANCE CHECK
+
+```{r}
+#function to calculate robust standard errors
+robust_info <- function(model){
+  model$vcovHC <- vcovHC(model)
+  model$coeftest <- coeftest(model, model$vcovHC)
+  model$robust_se <- sqrt(diag(model$vcovHC))
+  return(model)
+} 
+```
+
+```{r}
+data[ , Female := ifelse(V2=="Female", 1, 0)]
+data[ , Region_West := ifelse(V3=="West", 1, 0)]
+data[ , Region_Midwest := ifelse(V3=="Midwest", 1, 0)]
+data[ , Region_Northeast := ifelse(V3=="Northeast", 1, 0)]
+data[ , Region_South := ifelse(V3=="South", 1, 0)]
+data[ , Immigrate_Self := ifelse(V4=="I immigrated to the U.S.", 1, 0)]
+data[ , Immigrate_Parents := ifelse(V4=="My parents immigrated to the U.S.", 1, 0)]
+data[ , Immigrate_Grandparents := ifelse(V4=="My grandparents immigrated to the U.S.", 1, 0)]
+data[ , Immigrate_GreatGrandparents := ifelse(V4=="My great-grandparents immigrated to the U.S.", 1, 0)]
+data[ , Immigrate_None := ifelse(V4=="My great-grandparents were born in the U.S.", 1, 0)]
+
+cov_check <- lm(Treatment ~ Female + Region_Midwest + Region_Northeast + Region_South + Immigrate_Self + Immigrate_Parents + Immigrate_Grandparents + Immigrate_GreatGrandparents, data=data[Reached_Ethnic_Question==1 & Attrition==0])
+cov_check <- robust_info(cov_check)
+cov_check$coeftest
+```
+
+```{r echo=T, results='hide'}
+stargazer(cov_check, 
+          type = 'latex', 
+          se=cov_check$robust_se, 
+          star.char=c('*', '**', '***'), 
+          star.cutoffs=c(.05, .01, .001),
+          single.row = TRUE
+          )
+```
+
+
+### IV. REGRESSION MODELS
+
+#### a. Selection of White
+
+```{r}
+#Is there a treatment effect for number of people selecting White? There is a 2.5% decrease in people selecting White, however this difference between the treatments is not significant.
+mod_white <- lm(White ~ Treatment, data=data[Reached_Ethnic_Question==1 & Attrition==0])
+mod_white <- robust_info(mod_white)
+mod_white$coeftest
+```
+
+
+```{r}
+#Accounting for the attrition rate, what is the treatment effect on selecting White on the lower extreme? Since a negative coefficient was found, set all responses for attriters as White=1 in control and White=0 in treatment.
+data[Attrition==1 & Treatment==0, White := 1]
+data[Attrition==1 & Treatment==1, White := 0]
+mod_white_lower <- lm(White ~ Treatment, data=data[Reached_Ethnic_Question==1])
+mod_white_lower <- robust_info(mod_white_lower)
+mod_white_lower$coeftest
+```
+
+```{r}
+#Accounting for the attrition rate, what is the treatment effect on selecting White on the upper extreme? Since a negative coefficient was found, set all responses for attriters as White=0 in control and White=1 in treatment.
+data[Attrition==1 & Treatment==0, White := 0]
+data[Attrition==1 & Treatment==1, White := 1]
+mod_white_upper <- lm(White ~ Treatment, data=data[Reached_Ethnic_Question==1])
+mod_white_upper <- robust_info(mod_white_upper)
+mod_white_upper$coeftest
+```
+
+
+
+```{r}
+#Does the treatment effect change when including covariates as controls? There was no treatment effect to begin with.
+mod_white_covariates <- lm(White ~ Treatment + Female + Region_Midwest + Region_Northeast + Region_South + Immigrate_Self + Immigrate_Parents + Immigrate_Grandparents + Immigrate_GreatGrandparents, data=data[Reached_Ethnic_Question==1 & Attrition==0])
+mod_white_covariates <- robust_info(mod_white_covariates)
+mod_white_covariates$coeftest
+```
+
+#### b. Selection of Other
+
+```{r}
+#Is there a treatment effect for number of people selecting Other? There is no difference between the number of people who select Other in either question.
+mod_other <- lm(Other ~ Treatment, data=data[Reached_Ethnic_Question==1 & Attrition==0])
+mod_other <- robust_info(mod_other)
+mod_other$coeftest
+```
+
+```{r}
+#Accounting for the attrition rate, what is the treatment effect on selecting Other on the lower extreme? Since a positive coefficient was found, set all responses for attriters as Other=1 in control and Other=0 in treatment.
+data[Attrition==1 & Treatment==0, Other := 1]
+data[Attrition==1 & Treatment==1, Other := 0]
+mod_other_lower <- lm(Other ~ Treatment, data=data[Reached_Ethnic_Question==1])
+mod_other_lower <- robust_info(mod_other_lower)
+mod_other_lower$coeftest
+```
+
+```{r}
+#Accounting for the attrition rate, what is the treatment effect on selecting Other on the upper extreme? Since a positive coefficient was found, set all responses for attriters as Other=0 in control and Other=1 in treatment.
+data[Attrition==1 & Treatment==0, Other := 0]
+data[Attrition==1 & Treatment==1, Other := 1]
+mod_other_upper <- lm(Other ~ Treatment, data=data[Reached_Ethnic_Question==1])
+mod_other_upper <- robust_info(mod_other_upper)
+mod_other_upper$coeftest
+```
+
+#### c. Selection of Hispanic
+
+```{r}
+#Is there a treatment effect for number of people selecting Hispanic? Yes, there is a causal treatment effect on the number of people who select Hispanic There were 4.7% less people who selected Hispanic in treatment.
+mod_hispanic <- lm(Hispanic ~ Treatment, data=data[Reached_Ethnic_Question==1 & Attrition==0])
+mod_hispanic <- robust_info(mod_hispanic)
+mod_hispanic$coeftest
+```
+
+```{r}
+#Accounting for the attrition rate, what is the treatment effect on selecting Hispanic on the lower extreme? Since a negative coefficient was found, set all responses for attriters as Hispanic=0 in control and Hispanic=1 in treatment.
+data[Attrition==1 & Treatment==0, Hispanic := 0]
+data[Attrition==1 & Treatment==1, Hispanic := 1]
+mod_hispanic_lower <- lm(Hispanic ~ Treatment, data=data[Reached_Ethnic_Question==1])
+mod_hispanic_lower <- robust_info(mod_hispanic_lower)
+mod_hispanic_lower$coeftest
+```
+
+```{r}
+#Accounting for the attrition rate, what is the treatment effect on selecting Hispanic on the upper extreme? Since a negative coefficient was found, set all responses for attriters as Hispanic=1 in control and Hispanic=0 in treatment.
+data[Attrition==1 & Treatment==0, Hispanic := 1]
+data[Attrition==1 & Treatment==1, Hispanic := 0]
+mod_hispanic_upper <- lm(Hispanic ~ Treatment, data=data[Reached_Ethnic_Question==1])
+mod_hispanic_upper <- robust_info(mod_hispanic_upper)
+mod_hispanic_upper$coeftest
+```
+
+#### d. Identifying as MENA
+
+```{r}
+#Is there a treatment effect for number of people selecting MENA or filling in a race that is in MENA? No, there is no difference in the number of people who identify themselves as MENA in either question.
+mod_mena <- lm(MENA_writein ~ Treatment, data=data[Reached_Ethnic_Question==1 & Attrition==0])
+mod_mena <- robust_info(mod_mena)
+mod_mena$coeftest
+```
+
+```{r}
+#Accounting for the attrition rate, what is the treatment effect on identifying as MENA on the lower extreme? Since a positive coefficient was found, set all responses for attriters as MENA_writein=1 in control and MENA_writein=0 in treatment.
+data[Attrition==1 & Treatment==0, MENA_writein := 1]
+data[Attrition==1 & Treatment==1, MENA_writein := 0]
+mod_mena_lower <- lm(MENA_writein ~ Treatment, data=data[Reached_Ethnic_Question==1])
+mod_mena_lower <- robust_info(mod_mena_lower)
+mod_mena_lower$coeftest
+```
+
+```{r}
+#Accounting for the attrition rate, what is the treatment effect on identifying as MENA on the higher extreme? Since a positive coefficient was found, set all responses for attriters as MENA_writein=0 in control and MENA_writein=1 in treatment.
+data[Attrition==1 & Treatment==0, MENA_writein := 0]
+data[Attrition==1 & Treatment==1, MENA_writein := 1]
+mod_mena_higher <- lm(MENA_writein ~ Treatment, data=data[Reached_Ethnic_Question==1])
+mod_mena_higher <- robust_info(mod_mena_higher)
+mod_mena_higher$coeftest
+```
+
+#### e. Identifying as Mixed Race
+
+```{r}
+#Is there a treatment effect for number of people selecting two or more races? No, there is no difference in the number of people who identify themselves as having two or more races.
+mod_mixed_race <- lm(Mixed_Race ~ Treatment, data=data[Reached_Ethnic_Question==1 & Attrition==0])
+mod_mixed_race <- robust_info(mod_mixed_race)
+mod_mixed_race$coeftest
+```
+
+```{r}
+#Accounting for the attrition rate, what is the treatment effect on identifying as mixed raced on the lower extreme? Since a positive coefficient was found, set all responses for attriters as Mixed_Race=1 in control and Mixed_Race=0 in treatment.
+data[Attrition==1 & Treatment==0, Mixed_Race := 1]
+data[Attrition==1 & Treatment==1, Mixed_Race := 0]
+mod_mixed_race_lower <- lm(Mixed_Race ~ Treatment, data=data[Reached_Ethnic_Question==1])
+mod_mixed_race_lower <- robust_info(mod_mixed_race_lower)
+mod_mixed_race_lower$coeftest
+```
+
+```{r}
+#Accounting for the attrition rate, what is the treatment effect on identifying as mixed raced on the upper extreme? Since a positive coefficient was found, set all responses for attriters as Mixed_Race=0 in control and Mixed_Race=1 in treatment.
+data[Attrition==1 & Treatment==0, Mixed_Race := 0]
+data[Attrition==1 & Treatment==1, Mixed_Race := 1]
+mod_mixed_race_upper <- lm(Mixed_Race ~ Treatment, data=data[Reached_Ethnic_Question==1])
+mod_mixed_race_upper <- robust_info(mod_mixed_race_upper)
+mod_mixed_race_upper$coeftest
+```
+
+#### f. Disclosing White Subgroups
+
+```{r}
+#one hot encode white respondents filling in something
+
+#function to replace blanks with missing
+blank2na <- function(x){ 
+    z <- gsub("\\s+", "", x)  
+    x[z==""] <- NA 
+    return(x)
+}
+
+#apply that function
+data[ , "C3_1_TEXT":= data.frame(sapply(data$C3_1_TEXT,  blank2na))]
+data[ , "T2_8_TEXT":= data.frame(sapply(data$T2_8_TEXT,  blank2na))]
+
+#create categorical column for whether white respondent further shared ethnicity
+data[ , "White_Subgroups" := 0]
+data[is.na(`C3_1_TEXT`)==FALSE & Treatment==0, "White_Subgroups" := 1]
+data[grepl("WHITE – Provide details below.,[A-Z][a-z]",T2)==TRUE & Treatment==1, "White_Subgroups" := 1]
+```
+
+```{r}
+mod_white_subgroups <- lm(White_Subgroups ~ Treatment, data=data[Reached_Ethnic_Question==1 & Attrition==0 & White==1])
+mod_white_subgroups <- robust_info(mod_white_subgroups)
+mod_white_subgroups$coeftest
+```
+
+```{r}
+#Accounting for the attrition rate, what is the treatment effect on disclosing a white subgroup on the lower extreme? Since a positive coefficient was found, set all responses for attriters as White_Subgroups=1 in control and White_Subgroups=0 in treatment. Also set all responses for attriters as if they had selected White.
+data[Attrition==1 & Treatment==0, White_Subgroups := 1]
+data[Attrition==1 & Treatment==1, White_Subgroups := 0]
+data[Attrition==1, White := 1]
+mod_white_subgroups_lower <- lm(White_Subgroups ~ Treatment, data=data[Reached_Ethnic_Question==1 & White==1])
+mod_white_subgroups_lower <- robust_info(mod_white_subgroups_lower)
+mod_white_subgroups_lower$coeftest
+```
+
+```{r}
+#Accounting for the attrition rate, what is the treatment effect on disclosing a white subgroup on the upper extreme? Since a positive coefficient was found, set all responses for attriters as White_Subgroups=0 in control and White_Subgroups=1 in treatment.
+data[Attrition==1 & Treatment==0, White_Subgroups := 0]
+data[Attrition==1 & Treatment==1, White_Subgroups := 1]
+mod_white_subgroups_upper <- lm(White_Subgroups ~ Treatment, data=data[Reached_Ethnic_Question==1 & White==1])
+mod_white_subgroups_upper <- robust_info(mod_white_subgroups_upper)
+mod_white_subgroups_upper$coeftest
+```
+
+#### g. Time Spent on Question
+
+```{r}
+#check if there is a difference in time spent on the ethnicity survey
+mod_time <- lm(Time ~ Treatment, data=data[Reached_Ethnic_Question==1 & Attrition==0])
+mod_time <- robust_info(mod_time)
+mod_time$coeftest
+```
+
+```{r}
+#Accounting for the attrition rate, what is the treatment effect on time to answer the question on the lower extreme? Since a positive coefficient was found, set all responses for attriters as Time=472.5 (maximum time from all observations, excluding the 1 outlier at 3198.5 seconds) in control and Time=5.9 (maximum time from all observations) in treatment.
+data[Attrition==1 & Treatment==0, Time := 472.5]
+data[Attrition==1 & Treatment==1, Time := 5.9]
+mod_time_lower <- lm(Time ~ Treatment, data=data[Reached_Ethnic_Question==1])
+mod_time_lower <- robust_info(mod_time_lower)
+mod_time_lower$coeftest
+```
+
+```{r}
+#Accounting for the attrition rate, what is the treatment effect on time to answer the question on the upper extreme? Since a positive coefficient was found, set all responses for attriters as Time=5.9 in control and Time=472.5 in treatment.
+data[Attrition==1 & Treatment==0, Time := 5.9]
+data[Attrition==1 & Treatment==1, Time := 472.5]
+mod_time_upper <- lm(Time ~ Treatment, data=data[Reached_Ethnic_Question==1])
+mod_time_upper <- robust_info(mod_time_upper)
+mod_time_upper$coeftest
+```
+
+#### h. Heterogeneous Treatment Effects
+
+```{r}
+hte_test <- function(outcome, covariate){
+  mod_hte <- lm(eval(as.name(outcome)) ~ (Treatment + eval(as.name(covariate)))^2, data=data[Reached_Ethnic_Question==1 & Attrition==0])
+  mod_hte <- robust_info(mod_hte)
+  estimate <- mod_hte$coeftest[4,1]
+  se <- mod_hte$coeftest[4,2]
+  p_value <- mod_hte$coeftest[4,4]
+  return(data.table(outcome, covariate, estimate, se, p_value))
+}
+```
+
+```{r}
+hte_results <- data.table()
+hte_results <- rbind(hte_results, hte_test("White", "Female"))
+hte_results <- rbind(hte_results, hte_test("White", "Region_West"))
+hte_results <- rbind(hte_results, hte_test("White", "Region_Midwest"))
+hte_results <- rbind(hte_results, hte_test("White", "Region_Northeast"))
+hte_results <- rbind(hte_results, hte_test("White", "Region_South"))
+hte_results <- rbind(hte_results, hte_test("White", "Immigrate_Self"))
+hte_results <- rbind(hte_results, hte_test("White", "Immigrate_Parents"))
+hte_results <- rbind(hte_results, hte_test("White", "Immigrate_Grandparents"))
+hte_results <- rbind(hte_results, hte_test("White", "Immigrate_GreatGrandparents"))
+hte_results <- rbind(hte_results, hte_test("White", "Immigrate_None"))
+hte_results <- rbind(hte_results, hte_test("Other", "Female"))
+hte_results <- rbind(hte_results, hte_test("Other", "Region_West"))
+hte_results <- rbind(hte_results, hte_test("Other", "Region_Midwest"))
+hte_results <- rbind(hte_results, hte_test("Other", "Region_Northeast"))
+hte_results <- rbind(hte_results, hte_test("Other", "Region_South"))
+hte_results <- rbind(hte_results, hte_test("Other", "Immigrate_Self"))
+hte_results <- rbind(hte_results, hte_test("Other", "Immigrate_Parents"))
+hte_results <- rbind(hte_results, hte_test("Other", "Immigrate_Grandparents"))
+hte_results <- rbind(hte_results, hte_test("Other", "Immigrate_GreatGrandparents"))
+hte_results <- rbind(hte_results, hte_test("Other", "Immigrate_None"))
+hte_results <- rbind(hte_results, hte_test("Hispanic", "Female"))
+hte_results <- rbind(hte_results, hte_test("Hispanic", "Region_West"))
+hte_results <- rbind(hte_results, hte_test("Hispanic", "Region_Midwest"))
+hte_results <- rbind(hte_results, hte_test("Hispanic", "Region_Northeast"))
+hte_results <- rbind(hte_results, hte_test("Hispanic", "Region_South"))
+hte_results <- rbind(hte_results, hte_test("Hispanic", "Immigrate_Self"))
+hte_results <- rbind(hte_results, hte_test("Hispanic", "Immigrate_Parents"))
+hte_results <- rbind(hte_results, hte_test("Hispanic", "Immigrate_Grandparents"))
+hte_results <- rbind(hte_results, hte_test("Hispanic", "Immigrate_GreatGrandparents"))
+hte_results <- rbind(hte_results, hte_test("Hispanic", "Immigrate_None"))
+hte_results <- rbind(hte_results, hte_test("MENA_writein", "Female"))
+hte_results <- rbind(hte_results, hte_test("MENA_writein", "Region_West"))
+hte_results <- rbind(hte_results, hte_test("MENA_writein", "Region_Midwest"))
+hte_results <- rbind(hte_results, hte_test("MENA_writein", "Region_Northeast"))
+hte_results <- rbind(hte_results, hte_test("MENA_writein", "Region_South"))
+hte_results <- rbind(hte_results, hte_test("MENA_writein", "Immigrate_Self"))
+hte_results <- rbind(hte_results, hte_test("MENA_writein", "Immigrate_Parents"))
+hte_results <- rbind(hte_results, hte_test("MENA_writein", "Immigrate_Grandparents"))
+hte_results <- rbind(hte_results, hte_test("MENA_writein", "Immigrate_GreatGrandparents"))
+hte_results <- rbind(hte_results, hte_test("MENA_writein", "Immigrate_None"))
+hte_results[ , "significant" := ifelse(p_value <= 0.05, 1L, 0L)]
+hte_results[ , "significant_bonferroni" := ifelse(p_value <= 0.05/10, 1L, 0L)]
+hte_results
+```
+```{r echo=T, results='hide'}
+print(xtable(hte_results), include.rownames=FALSE)
+```
+
+#### i. Stargazer charts
+
+```{r echo=T, results='hide'}
+stargazer(mod_white, mod_other, mod_hispanic, mod_mena, 
+          type = 'latex', 
+          se=list(mod_white$robust_se, mod_other$robust_se, mod_hispanic$robust_se, mod_mena$robust_se), 
+          star.char=c('*', '**', '***'), 
+          star.cutoffs=c(.05, .01, .001),
+          column.sep.width = "1pt"
+          #omit.stat=c("ser","f")
+          )
+```
+
+```{r echo=T, results='hide'}
+stargazer(mod_mixed_race, mod_white_subgroups, mod_time, 
+          type = 'latex', 
+          se=list( mod_mixed_race$robust_se, mod_white_subgroups$robust_se, mod_time$robust_se), 
+          star.char=c('*', '**', '***'), 
+          star.cutoffs=c(.05, .01, .001),
+          column.sep.width = "1pt"
+          #omit.stat=c("ser","f")
+          )
+```
